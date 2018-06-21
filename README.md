@@ -152,4 +152,119 @@ trait Parsers[ParseError, Parser[+ _]] {
 }
 ```
 
+また、パーサーの「繰り返し」を認識できるよう、前章でも登場したようなlistOfN関数を用意する。
 
+```
+def listOfN[A](n: Int, p: Parser[A]): Parser[List[A]]
+```
+
+例として、listOfNに期待されるのは以下のような結果となる。
+
+```
+run(listOfN(3, "ab" | "cad"))("ababcad") == Right("ababcad")
+run(listOfN(3, "ab" | "cad"))("cadabab") == Right("cadabab")
+run(listOfN(3, "ab" | "cad"))("ababab") == Right("ababab")
+```
+
+これで、必要なコンビネータは一通り揃った。  
+が、以下のような点に触れられていない
+- 代数を最小限のプリミティブに絞り込むことができていない
+- より汎用的な法則について語られていない
+
+以下のようなパーサーを考えていきます。
+
+- 'a'の文字を0個以上認識するParser[Int]
+- 'a'の文字を1個以上認識するParser[Int]
+- 0個以上の'a'に続いて1個以上の'b'を認識するパーサー
+
+## 9.2 代数の例
+
+例えば、文字列`"aa"`が与えられたとき、`'a'`という文字列を認識し、その文字数(2)を返すパーサーを考える。  
+
+```
+def many[A](p: Parser[A]): Parser[List[A]]
+```
+
+ただ、これはパーサーのListを返す関数であり、求めている「要素数を返す」ものではない。  
+愚直に上記manyコンビネータを変更し`Parser[Int]`を返すようにすることも不可能ではないが、こういう場合、コンビネータmapを追加するのが良い。  
+
+```
+def map[A, B](a: Parser[A])(f: A => B): Parser[B]
+```
+
+これにより、パーサーを以下のように定義できる。  
+
+```
+map(many(char('a')))(_.size)
+```
+
+ParserOpsにmapとmanyをメソッドとして追加し、同じ内容をもう少し便利な構文で記述できるようにする。
+
+```
+val numA: Parser[Int] = char('a').many.map(_.size)
+```
+
+期待する結果は以下の通り。
+
+```
+run(numA)("aaa") == Right(3)
+run(numA)("b") == Right(0)
+```
+
+ここで、mapの振る舞いについて強く期待するのは、Parserが成功した場合、**mapが結果の値を変換するだけ**でなければならないことである。  
+- 他の入力文字がmapによって調査されることがあってはならない
+- 失敗したパーサーがmapを通じて成功したパーサーになることもありえない
+
+一般的には、`Par`や`Gen`と同様に、mapにも**構造を維持すること**が期待される。
+
+```
+map(p)(a => a) == p
+```
+
+この法則を文書化するには？
+-> 前章でのテスティングの話を活用する
+
+```
+// Parserとmapの結合
+import fpinscala.testing._
+
+trait Parsers[ParseError, Parser[+_]] { self =>
+  ・・・
+  object Laws {
+    def equal[A](p1: Parser[A], p2: Parser[A])(in: Gen[String]): Prop =
+      forAll(in)(s => run(p1)(s) == run(p2)(s))
+      
+    def mapLaw[A](p: Parser[A])(in: Gen[String]): Prop =
+      equal(p, p.map(a => a))(in)
+  }
+}
+```
+
+後ほど、Parser**s**の実装をテストするのに役に立つ。  
+法則が見つかった場合、それらを実際のプロパティとしてLawsオブジェクトに書き加えることが推奨される。  
+
+これで、mapを利用できるようになったので、charをstringに基づいて実装してみる。
+
+```
+def char(c: Char): Parser[Char] =
+  string(c.toString) map (_.charAt(0))
+```
+
+
+同様に、別のコンビネータ`succeed`もstringとmapを使って定義できる。  
+
+```
+def succeed[A](a: A): Parser[A] = 
+  string("") map (_ => a)
+```
+
+string("")は入力が空でも常に成功するので、  
+このパーサーは入力文字列に関係なく常に`a`の値で成功する。
+
+```
+run(succeed(a))(s) == Right(a)
+```
+
+### 9.2.1 スライスと空ではない繰り返し
+
+まだ
