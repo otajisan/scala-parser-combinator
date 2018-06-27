@@ -71,18 +71,21 @@ def run[A](p: Parser[A])(input: String): Either[ParseError, A]
 これらを明示的に指定するtraitを以下のように定義する。
 
 ```
-trait Parsers[ParseError, Parser[+ _]] {
+trait Parsers[ParseError, Parser[+_]] {
   def run[A](p: Parser[A])(input: String): Either[ParseError, A]
   def char(c: Char): Parser[Char]
 }
 ```
 
-ここで、`Parser[+ _]`という型引数は何か、となりますが、このあと数章に渡って詳しく説明されるらしいのでこの時点ではあまり重要ではない(らしい)  
+ここで、`Parser[+_]`という型引数は何か、となりますが、このあと数章に渡って詳しく説明されるらしいのでこの時点ではあまり重要ではない(らしい)  
 それ自体が型コンストラクタである型パラメータに対するScalaの構文(と　書いてあった)
 - `ParseError`を型引数にすると、`Parsers`インターフェースが`ParseError`のあらゆる表現に対応する
 - `Parser[+_]`を型パラメータにすると、`Parsers`インターフェースが`Parser`のあらゆる表現に対応する
 
-アンダースコア`_`は、Parserが何であれ、`Parser[Char]`のように結果の方を表す型引数を1つ期待することを意味する。  
+アンダースコア`_`は、Parserが何であれ、`Parser[Char]`のように結果の型を表す型引数を1つ期待することを意味する。  
+
+とりあえず書籍のこの説明は分かりづらかったが、以下のドワンゴのドキュメントを見ると共変がだんだんわかってくる。  
+[型パラメータと変位指定](https://dwango.github.io/scala_text/type-parameter.html)
 
 この`char`関数は、以下の式を満たす必要がある。
 
@@ -125,34 +128,66 @@ run(or(string("abra"), string("cadabra")))("abra") == Right("abra")
 run(or(string("abra"), string("cadabra")))("cadabra") == Right("cadabra")
 ```
 
-さらに、implicitを使って以下のように便利な中置構文を割り当てられる。
+さらに、implicitを使って便利な中置構文(`.`や`()`を省略した記法のこと)を割り当てられる。
+先に、implicitをちょっとおさらい。
 
 ```
-trait Parsers[ParseError, Parser[+ _]] {
+scala> def logInt(i: Int) = println(i)
+logInt: (i: Int)Unit
+
+/* これは通る */
+scala> logInt(3)
+3
+
+/* これはエラー */
+scala> logInt(0.2f)
+<console>:13: error: type mismatch;
+ found   : Float(0.2)
+ required: Int
+       logInt(0.2f)
+              ^
+```
+
+```
+/* なので「暗黙的に」型を変換するimplicit def floatToIntを定義する */
+scala> implicit def floatToInt(f: Float): Int = f.toInt
+warning: there was one feature warning; re-run with -feature for details
+floatToInt: (f: Float)Int
+
+scala> logInt(0.2f)
+0
+
+/* コンパイル時にFloatからIntに変換できる関数があるかを探して，勝手にやってくれます。 */
+```
+
+これでバッチリ！  
+本題。
+
+```
+trait Parsers[ParseError, Parser[+_]] {
   self =>
   def run[A](p: Parser[A])(input: String): Either[ParseError, A]
 
   // 2つのパーサーから選択する多相コンビネータ
   def or[A](s1: Parser[A], s2: Parser[A]): Parser[A]
 
-  // コンビネータ(string)を定義
+  // 以下string/asStringParserの2つの関数により、与えられたStringがParserへ自動的に昇格される
   implicit def string(s: String): Parser[String]
-
   implicit def operators[A](p: Parser[A]) = ParserOps[A](p)
-
   implicit def asStringParser[A](a: A)(implicit f: A => Parser[String]):
-  ParserOps[String] = ParserOps(f(a))
+    ParserOps[String] = ParserOps(f(a))
 
+  // 中置構文の割り当て。これによりs1 or s2、s1 | s2のような中置構文をこのParserに適用できる
   case class ParserOps[A](p: Parser[A]) {
+    // B >: A -> 「BはAの継承元である」という制約を表す
     def |[B >: A](p2: Parser[B]): Parser[B] = self.or(p, p2)
-
     def or[B >: A](p2: => Parser[B]): Parser[B] = self.or(p, p2)
   }
 
 }
 ```
 
-また、パーサーの「繰り返し」を認識できるよう、前章でも登場したようなlistOfN関数を用意する。
+また、パーサーの「繰り返し」を認識できるよう、前章でも登場したようなlistOfN関数を用意する。  
 
 ```
 def listOfN[A](n: Int, p: Parser[A]): Parser[List[A]]
@@ -267,4 +302,90 @@ run(succeed(a))(s) == Right(a)
 
 ### 9.2.1 スライスと空ではない繰り返し
 
-まだ
+- manyとmapを使って`a`の数を数えるタスクはできた
+- ただし、長さを取り出して値を捨ててしまうだけのために`List[Char]`を構築するのは若干非効率
+- **「入力文字列のどの部分を調べているのかを確認する」**という目的でのみParserを実行できれば便利なはず
+
+そんなコンビネータを考える。  
+
+```
+def slice[A](p: Parser[A]): Parser[String]
+```
+
+この`slice`コンビネータは、入力文字列の調査した部分を返す。  
+
+```
+run(slice(('a'|'b').many))("aaba") == Right("aaba")
+```
+
+を満たす。  
+つまり、`many`が生成したリストのサイズを見るのでなく、パーサーとマッチした部分の入力文字列を返す、というだけ。  
+これを定義することで、文字`a`の数を数えるパーサーを
+
+```
+char('a').many.slice.map(_.size)
+```
+と記述できる。  
+このとき`_.size`はListのsizeメソッドでなく、**Stringのsizeメソッド**を参照している、というのがポイント。  
+参考として、先ほどのmanyのみを使った場合は以下。
+
+```
+char('a').many.map(_.size)
+```
+
+ここまでで、インターフェースは提供できたので、次に実装を考えていきます。  
+
+文字`a`を1つ以上認識したい場合を考えます。  
+そのためのコンビネータとして`many1`を追加します。  
+
+```
+def many1[A](p: Parser[A]): Parser[List[A]]
+```
+
+many1はプリミティブではないはずだが、manyをベースとして定義できるはず。  
+
+```
+def many[A](p: Parser[A]): Parser[List[A]]
+```
+
+なので、実際見てみると、`many1(p)`は`p`の後に`many(p)`が続いているだけ。  
+したがって、1つ目のパーサーを実行し、それが成功すると仮定して、別のパーサーを実行する方法が必要。  
+それを追加してみる。  
+
+```
+def product[A, B](p: Parser[A], p2: Parser[B]): Parser[(A, B)]
+```
+
+ここで、以下の前提のもとにExercise
+
+- `**`と`product`は`ParserOps`のメソッドとして追加できる
+- `a ** b`と`a product b`はどちらも`product(a, b)`にデリゲートする
+
+```
+EXERCISE9.1
+
+productを使ってコンビネータmap2を実装し、これを使って、manyをベースとしてmany1を実装せよ。
+ここまでの章と同様に、map2をプリミティブにし、map2をベースとしてproductを定義することもできる。
+どちらを選択するかはあなた次第である。
+
+def map2[A, B, C](p: Parser[A], p2: Parser[B])(f: (A, B) => C): Parser[C]
+```
+
+```
+EXERCISE9.2
+難問：productの振る舞いを定義する法則を考え出せ
+```
+
+```
+EXERCISE9.3
+難問：先へ進む前に、or、map2、succeedをベースとしてmanyを定義できるか検討せよ
+```
+
+```
+EXERCISE9.4
+難問：map2とsucceedを使って先のlistOfNコンビネータを実装せよ
+
+def listOfN[A](n: Int, p: Parser[A]): Parser[List[A]]
+```
+
+## 次回ねっ！
