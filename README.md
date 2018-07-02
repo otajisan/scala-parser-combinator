@@ -268,7 +268,7 @@ trait Parsers[ParseError, Parser[+_]] { self =>
   object Laws {
     def equal[A](p1: Parser[A], p2: Parser[A])(in: Gen[String]): Prop =
       forAll(in)(s => run(p1)(s) == run(p2)(s))
-      
+
     def mapLaw[A](p: Parser[A])(in: Gen[String]): Prop =
       equal(p, p.map(a => a))(in)
   }
@@ -289,7 +289,7 @@ def char(c: Char): Parser[Char] =
 同様に、別のコンビネータ`succeed`もstringとmapを使って定義できる。  
 
 ```
-def succeed[A](a: A): Parser[A] = 
+def succeed[A](a: A): Parser[A] =
   string("") map (_ => a)
 ```
 
@@ -388,4 +388,157 @@ EXERCISE9.4
 def listOfN[A](n: Int, p: Parser[A]): Parser[List[A]]
 ```
 
-## 次回ねっ！
+## 9.3 文脈依存への対処
+
+ここまでに作成したプリミティブは以下の通り。
+
+|プリミティブ |説明|
+|-----------|---|
+|string(s) | Stringを1つ認識して返す |
+|slice(p) | 成功した場合はpが調べた部分の入力を返す |
+| succeed(a) | 常にaの値で成功する |
+| map(p)(f) | 成功した場合はpの結果に関数fを適用する |
+| product(p1, p2) | 2つのパーサーを逐次化してp1を実行した後にp2を実行し、両方が成功した場合にそれらの結果をペアで返す |
+| or(p1, p2) | 2つのパーサーのどちらかを選択し、最初にp1を試した後、p1が失敗した場合にp2を試す |
+
+実は、これらのプリミティブさえ揃ってしまえば、JSONなどあらゆる文脈自由文法を解析できてしまう。  
+
+## 9.4 JSONパーサーの作成
+
+関数型プログラミングでは代数を定義し、具体的な実装がない状態で、その表現力を調べるのが一般的。  
+(具体的な実装を急ぐと、実装による制限がかかってしまい、APIの変更が困難になるため)  
+特に、ライブラリの設計段階ではこれを意識し、まずはインターフェースを決めていくことに集中する。
+
+```
+def jsonParser[Err, Parser[+_]](P: Parsers[Err, Parser]): Parser[JSON] = {
+    import P._
+    val spaces = char(' ').many.slice
+    ・・・
+}
+```
+
+### 9.4.1 JSONの書式
+
+言わずもがな。以下のようなもの。
+
+```
+{
+    "Company name": "foo",
+    "Active": true,
+    "Price": 100.23,
+    "Related Companies"] [
+        "bar", "hoge", "fuga"
+    ]
+}
+```
+
+ここでは、このJSONドキュメントを解析することを考えていく。  
+(高機能なものでなく、構文ツリーを解析することのみを目的とする)  
+まずは、JSONドキュメントを表現するモノが必要。
+
+```
+trait JSON
+
+object JSON {
+    // それぞれの型に対応する表現
+    case object JNull extends JSON
+    case class JNumber(get: Double) extends JSON
+    case class JString(get: String) extends JSON
+    case class JBool(get: Boolean) extends JSON
+    case class JArray(get: IndexedSeq[JSON]) extends JSON
+    case class JObject(get: Map[String, JSON]) extends JSON
+}
+```
+
+### 9.4.2 JSONパーサー
+
+ここまでに作成した様々なプリミティブを利用し、Parser[JSON]を実装する。
+
+
+## 9.5 エラー報告
+
+Parsersの実装がどのようになるかが分からずとも、どのような値を与えられる可能性があるかを推定することはできる。  
+ここでは、エラーを報告するコンビネータを考えていく。
+
+### 9.5.1 設計の例
+
+まずは、そもそも「エラーメッセージ」を割り当てるプリミティブコンビネータ`label`を定義する。
+
+```
+// pが失敗した場合に、そのParseErrorにmsgを組み込む
+// つまり、返却されたParseErrorを検証したときに、type ParseError = Stringと、
+// 返されるParseErrorがlabelと等しいことを想定すれば良い、ということ
+def label[A](msg: String)(p: Parser[A]): Parser[A]
+```
+
+次に、「エラーの発生箇所」を明らかにするには？
+
+```
+case class Location(input: String, offset: Int = 0) {
+    lazy val line = input.slice(0, offset + 1).count(_ == '¥n') + 1
+    lazy val col = input.slice(0, offset + 1).lastIndexOf('¥n') match {
+        case -1 => offset + 1
+        case lineStart => offset - lineStart
+    }
+}
+
+def errorLocation(e: ParseError): Location
+def errorMessage(e: ParseError): String
+```
+
+Left(e)で失敗した場合、errorMessage(e)はlabelによって設定されたメッセージと等しくなる。  
+```
+・・・
+case Left(e) => errorMessage(e) == msg
+・・・
+```
+
+### 9.5.2 入れ子のエラー
+
+次に、パーサーに以下のような文字列が与えられるケースについて考える。  
+
+```
+val p = label("first magic word")("abra") **
+  " ".many ** // ホワイトスペースをスキップ
+  label("second magic word")("cadabra")
+```
+
+上記は`abra`と`cadabra`という2単語が指定されることを期待する。  
+これを以下のように実行。  
+
+```
+run(p)("abra cAdabra")
+```
+
+ここでは`A(大文字)`が不正(小文字の`a`を期待)である、というエラーを適切に報告したい。  
+「場所」の報告は確かにできそうだが、その情報って報告されて嬉しいんだっけ？と考える。  
+
+理想的には、`second magic word`の解析中に、想定外の`A`が検出されたことをエラーメッセージで伝えるべき。  
+したがって、こうしたラベルを**入れ子**にする方法を定義する。  
+
+```
+// pが失敗した場合に補足情報を追加する
+def scope[A](msg: String)(p: Parser[A]): Parser[A]
+// Parserが失敗時に実行していた処理を示すエラーメッセージのスタック
+case class ParseError(stack: List[(Location, String)])
+```
+
+このとき、
+`run(p)(s)`が`Left(e1)`の場合、  
+`run(scope(msg)(p))`は`Left(e2)`となる。
+
+つまり、
+```
+e2.stack.head == msg
+e2.stack.tail == e1
+```
+となる。
+
+今のところはエラーを報告するときに関連する情報がすべて含まれるようにしたいだけであり、  
+ほとんどの目的にはParseErrorで十分なようです。  
+なお、Parsersの実装では、ParseErrorの能力をすべて利用するのではなく、エラーの原因と場所についての基本情報のみを残したとしてもまったく妥当であることに注意。  
+
+### 9.5.3 分岐とバックトラックの制御
+
+
+
