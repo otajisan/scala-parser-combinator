@@ -540,5 +540,216 @@ e2.stack.tail == e1
 
 ### 9.5.3 分岐とバックトラックの制御
 
+1つ以上のエラーが発生した場合に、どのエラーを報告するかを判断する方法が必要。  
+以下のコードを例に考える。
+
+```
+val spaces = " ".many
+val p1 = scope("magic spell") {
+  "abra" ** spaces ** "cadabra"
+}
+val p2 = scope("gibberish") {
+  "abra" ** spaces ** "babba"
+}
+val p = p1 or p2
+```
+
+このとき、`run(p)("abra cAdabra")`からどのようなParseErrorが返されるようにすると良いか。  
+この場合、引数に与えられるのは`abra`と`cAdabra`なので、`or`のどちらの分岐でも入力エラーが生成される。  
+
+この例では、解析エラーとして`"magic spell"`を報告することにする。  
+
+`p1 or p2`の大まかな意味は、
+```
+入力でp1を実行してみて、
+p1で失敗した場合は同じ入力でp2を実行してみる
+```
+となる。  
+これを、
+```
+入力でp1を試してみて、
+それがコミットされていない状態で失敗した場合は、同じ入力でp2を実行し、
+それ以外の場合は失敗を報告する
+```
+に変更できる。
+
+この問題への一般的な解決策の1つは、結果を生成するためにパーサーが文字を1つでも調べる場合は、  
+それらすべてのパーサーを**デフォルトでコミットさせる**こと。  
+また、解析へのコミットを先送りさせる`attempt`コンビネータを追加する。  
+
+```
+def attempt[A](p: Parser[A]): Parser[A]
+```
+
+これは、以下の要件を満たすはず。  
+
+```
+// fail: 常に失敗するパーサー
+attempt(p flatMap (_ => fail)) or p2 == p2
+```
+
+これは、pが入力を調べている途中で失敗したとしても、`attempt`はその解析へのコミットを取り消し、p2を実行できるようにする。
+
+## 9.6 代数の実装
+
+ここまでは、代数を肉付けし、それをベースとして`Parser[JSON]`を定義してきた。  
+ここでは実際に試す。  
+
+```
+EXERCISE 9.12
+難問:事項では、Parserの表現を取り上げ、その表現を使ってParsersインターフェイスを実装する。
+だが、その前に自力で実装せよ。
+これは自由解答形式の設計タスクだが、ここまで設計してきた代数により、表現として考えられるものに大きな制約が課される。
+Parsersインターフェイスを実装するために使用できる、純粋関数型の単純なParser表現を思いつけるはずだ。
+コードは以下のようになる可能性がある。
+
+class MyParser[+A](...) {...}
+object MyParsers extends Parsers[MyParser] {
+  // プリミティブの実装
+}
+
+MyParserは、パーサーを表現するために使用するデータ型と置き換える。
+満足のいくものに仕上がった場合、行き詰まった場合、あるいはヒントがもう少しほしい場合は、このまま読み進めること。
+```
+
+とのことなので、このまま読み進める。
 
 
+### 9.6.1 実装の例
+
+Parserの最終的な表現に最初から取り組むのではなく、  
+この代数のプリミティブを調べて、それぞれのプリミティブをサポートするのに必要な情報を推測することで、実装を徐々に完成させていく。  
+
+まず、stringコンビネータから。  
+
+```
+def string(s: String): Parser[A]
+```
+
+関数`run`をサポートする必要があることがわかる。
+
+```
+def run[A](p: Parser[A])(input: String): Either[ParseError, A]
+```
+
+最初は、Parserが単にrun関数の実装であると想定できる。
+
+```
+type Parser[+A] = String => Either[ParseError, A]
+```
+
+これを使ってstringプリミティブを実装できる。 
+
+```
+def string(s: String): Parser[A] =
+  (input: String) =>
+    if (input.startsWith(s))
+      Right(s)
+    else
+      // ParseErrorを生成(toErrorは後ほど定義する)
+      Left(Location(input).toError("Expected: " + s))
+```
+
+else分岐でParseErrorを生成する必要があるが、これらをそこで生成するのは少し都合が悪いため、  
+Locationにヘルパー関数toErrorを追加する。
+
+```
+def toError(msg: String): ParseError =
+  ParseError(List((this, msg)))
+```
+
+### 9.6.2 パーサーの逐次化
+
+stringをサポートするParserの表現は作成できた。  
+逐次化を実現するには、消費された文字数をParserに通知させれば良い。
+
+```
+// パーサーが成功または失敗を示すResultを返すようになる
+type Parser[+A] = Location => Result[A]
+
+trait Result[+A]
+// 成功の場合は、パーサーによって消費された文字数を返す
+case class Success[+A](get: A, charsConsumed: Int) extends Result[A]
+case class Failure(get: ParseError) extends Result[Nothing]
+```
+
+単純にEitherを使用するのでなく、Resultという新しい型を使用し、  
+成功した場合は`A`型の値と、消費された入力文字の数を返す。  
+
+呼び出し元はこれを使ってLocationの状態を更新できる。
+
+### 9.6.3 パーサーのラベル付け
+
+失敗した場合はParseErrorスタックに新しいメッセージをpushしたいので、pushというヘルパー関数をParseErrorに定義する。
+
+```
+def push(loc: Location, msg: String): ParseError =
+  copy(stack = (loc, msg) :: stack)
+```
+
+これを使ってscopeを実装できる。
+
+```
+def scope[A](msg: String)(p: Parser[A]): Parser[A] =
+  // 失敗した場合はmsgをエラースタックにプッシュ
+  s => p(s).mapError(_.push(s.loc, msg))
+```
+
+`mapError`関数はResultで定義され、失敗した場合に関数を適用する。
+
+```
+def mapError(f: ParseError => ParseError): Result[A] = this match {
+  case Failure(e) => Failure(f(e))
+  case _ => this
+}
+```
+
+labelも同じように実装できるが、エラースタックにプッシュするのでなく、  
+すでにスタックに含まれているものを置き換える。
+
+```
+def label[A](msg: String)(p: Parser[A]): Parser[A] =
+  s => p(s).mapError(_.label(msg)) // ParseErrorのヘルパーメソッドlabelを呼び出す
+```
+
+ParseErrorに同じlabelという名前のヘルパー関数を追加する。
+
+```
+def label[A](s: String): ParseError =
+  ParseError(latestLoc.map((_,s)).toList)
+
+def latestLoc: Option[Location] =
+  latest map(_._1)
+
+def latest: Option[(Location, String)] =
+  stack.lastOption // スタックの最後の要素を取得する。スタックがからの場合はNone
+```
+
+### 9.6.4 フェイルオーバーとバックトラック
+
+orの挙動に期待するものとして、  
+`1つ目のパーサーを実行後、コミットされていなければ、2つ目のパーサーを実行する`
+ようにしたい。  
+なので、`パーサーがコミットされた状態で失敗したかどうか`を示すBoolean値をFailureケースに追加する。  
+
+```
+case class Failure(get: ParseError,
+                   isCommitted: Boolean) extends Result[Nothing]
+```
+
+さらに、attemptで発生した失敗のコミットを取り消すようにする。
+
+```
+def attempt[A](p: Parser[A]): Parser[A] =
+  s => p(s).uncommit
+
+def uncommit: Result[A] = this match {
+  case Failure(e, true) => Failure(e, false)
+  case _ => this
+}
+```
+
+## 9.7 まとめ
+
+- 本章では代数的設計手法を紹介
+- PartⅢではライブラリ同士の関係がどのような性質のものであるかを理解し、それらに共通する構造を抽象化する方法について説明する
